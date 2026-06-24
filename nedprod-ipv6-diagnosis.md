@@ -46,3 +46,43 @@ smtp_address_preference = ipv4
 While you're in the SPF record, fix the `ipv4:` typo regardless. DKIM would also satisfy Gmail's auth half, but the PTR is mandatory for IPv6 either way — so option 1 isn't optional if Niall wants to keep sending over v6.
 
 The single root cause: the host prefers outbound IPv6, but only the IPv4 identity (PTR + SPF) was ever set up. Tell Niall either to pin Postfix to IPv4 or to finish the IPv6 setup (PTR + SPF) — both records, not one.
+
+---
+
+# Follow-up Q&A
+
+> **Question:** Can this be fixed on my side?
+
+Short answer: **no, not really — this has to be fixed on Niall's side.** Here's why, specifically for your setup.
+
+Your domain `hectorhattie.com` delivers to Google Workspace (`aspmx.l.google.com` at priority 1; there's an Outlook MX but only as a priority-99 backup that senders won't touch while Google is reachable). So the server rejecting Niall's mail is Google's inbound edge.
+
+The `550-5.7.1 IPv6AuthError` is a **hard rejection at the SMTP transaction** (it happens "in reply to end of DATA", *before* the message is ever accepted into your mailbox). It's enforced by Google's edge MX as a baseline policy on all inbound IPv6 mail — it is not a spam-score decision tied to your tenant.
+
+The two recipient-side levers people reach for don't apply here:
+
+- **Email allowlist / approved-senders IP list (Admin console):** this only influences *spam classification of mail that has already been accepted*. It does not waive the IPv6 PTR/SPF-or-DKIM requirement — the message is bounced before that stage. There is no Workspace admin toggle to disable the IPv6 PTR requirement.
+- **Inbound gateway:** governs how Google treats mail arriving *via your own configured gateway*, not arbitrary external senders like nedprod. Doesn't help.
+- **Your backup Outlook MX (priority 99):** Niall's server only falls back to it if *every* Google MX (priorities 1/5/10) is unreachable, which they aren't. So it won't catch this mail.
+
+So the fix genuinely belongs to nedprod — either pin their Postfix to IPv4 (`smtp_address_preference = ipv4`), or set up the missing PTR for `2a01:5e0:36:5093::1` and add `ip6:` to their SPF. All three are things only Niall (or his host, 9t4.net) can change.
+
+The one practical thing you *can* do from your side: send Niall a precise description of what's broken so it gets fixed fast rather than bouncing around as "generic email problems."
+
+---
+
+> **Question:** Would Niall have issues sending to normal gmail addresses? I'm surprised he hasn't seen this before.
+
+**Yes — a normal `@gmail.com` address would bounce exactly the same way.** Consumer Gmail's MX (`gmail-smtp-in.l.google.com`) publishes AAAA records (`2607:f8b0:4004:c1f::1a`) just like the Workspace MX his mail to you hit. It's the same Google edge enforcing the same IPv6 PTR + auth policy. There's no difference between Workspace and consumer Gmail here. So if his server reaches Gmail over IPv6, it bounces regardless of whether the recipient is `@gmail.com` or a Workspace domain.
+
+So why hasn't he tripped over it before? The failure is **narrow and intermittent**, which is exactly the kind of thing that hides for a long time:
+
+1. **It only bites over IPv6, and only against strict receivers.** Mail leaves his box over v6 *only* when (a) his server currently has a working outbound IPv6 route, and (b) the destination MX has AAAA records. The big receiver that *also strictly enforces* PTR+auth on v6 is Google. Plenty of other providers either have no AAAA on their MX (so his mail goes v4 and works) or are lenient. So the bulk of his mail flows fine over IPv4 — only Gmail-bound mail that happens to go v6 fails.
+
+2. **He almost certainly doesn't think of his server as "doing IPv6."** `mail.nedprod.com` publishes only an A record, no AAAA — so inbound is pure IPv4 and the server *looks* v4-only. But the box has a global v6 address and the OS/Postfix silently prefers v6 outbound when the far end offers it. That mismatch (v4 identity, v6 egress) is the trap, and it's invisible unless you look at outbound connection logs.
+
+3. **It's likely recent.** The smoking gun is the lame delegation: the `/64` reverse zone was delegated *to his own nameserver* (`46.167.244.58`) but that server refuses it. That pattern says the provider (9t4.net) handed nedprod the IPv6 block and pointed reverse DNS at his box expecting him to host it — and he never created the zone. Whenever that v6 connectivity/delegation got switched on (provider change, OS/Postfix update flipping address preference), outbound mail quietly started taking the v6 path. Before that, everything went v4 and there was nothing to notice.
+
+4. **Intermittency masks it.** If v6 reachability is at all flaky, the same recipient succeeds one day (went v4) and bounces another (went v6). That reads as a random glitch, not a systematic config error — easy to shrug off.
+
+Net: it's not that his setup was fine and your domain is special; it's that his server only recently/occasionally started emitting over a broken IPv6 identity, and Gmail is the receiver most likely to slam the door on it. As more receivers enable IPv6 and tighten enforcement, he'd see this spread. The IPv4-pin fix (`smtp_address_preference = ipv4`) makes it all go away immediately; the PTR+SPF fix makes IPv6 actually correct.
